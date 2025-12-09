@@ -5,10 +5,6 @@ set -u # treat unset variables as an error
 
 cd ${SRC_DIR}
 
-# silence clang >=15 int-to-pointer diagnostics in bundled glib
-CFLAGS="${CFLAGS:-} -Wno-int-conversion"
-export CFLAGS
-
 cp ${PROJECT_DIR}/scripts/pkg-config/meson.build ./meson.build
 meson setup build \
     --cross-file ${PROJECT_DIR}/cross-files/${OS}-${ARCH}.ini \
