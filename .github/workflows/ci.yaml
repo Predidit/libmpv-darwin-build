@@ -105,7 +105,7 @@ jobs:
           make build/output/debug.zip
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           if-no-files-found: error
           path: |
