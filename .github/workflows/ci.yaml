@@ -14,7 +14,7 @@ on:
 jobs:
   ci:
     name: ci
-    runs-on: macos-13
+    runs-on: macos-latest
     permissions:
       contents: write
     steps:
