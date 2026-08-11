@@ -76,39 +76,65 @@ index 8a96a37..579316d 100644
  
      if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
          return ret;
-@@ -2112,7 +2137,30 @@ static int hls_read_header(AVFormatContext *s)
+@@ -2112,7 +2137,56 @@ static int hls_read_header(AVFormatContext *s)
              pls->ctx->max_analyze_duration = s->max_analyze_duration > 0 ? s->max_analyze_duration : 4 * AV_TIME_BASE;
              pls->ctx->interrupt_callback = s->interrupt_callback;
              url = av_strdup(pls->segments[0]->url);
 -            ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, 0, 0);
-+            unsigned skip = 0;
-+            if (!c->seg_allow_img) {
-+                uint8_t b[10] = { 0 }; // probe at most 10
-+                avio_read(&pls->pb.pub, b, sizeof(b));
-+                avio_seek(&pls->pb.pub, 0, SEEK_SET);
-+                const AVProbeData pd = {
-+                    .buf = b,               // png, gif read_probe only use this field
-+                    .buf_size = sizeof(b),
-+                };
-+// optional: ffifmt(av_find_input_format("gif" or "gif_pipe" or "png_pipe"))->read_probe
-+                int max_score = AVPROBE_SCORE_MAX - 2; // png_pipe, gif, gif_pipe score >= AVPROBE_SCORE_MAX - 1
-+                const AVInputFormat* img_fmt = av_probe_input_format2(&pd, 1, &max_score);
-+                if (img_fmt) {
-+                    if (av_strstart(img_fmt->name, "png", NULL)) { // "png_pipe"
-+                        skip = 3; // skip until ts sync byte 'G'(0x47)
-+                        av_log(s, AV_LOG_INFO, "segments pretend to be png\n");
-+                    } else if (av_strstart(img_fmt->name, "gif", NULL)) {    // "gif", "gif_pipe"
-+                        skip = 10;
-+                        av_log(s, AV_LOG_INFO, "segments pretend to be gif\n");
++            /* Peek at the beginning of the first segment to detect
++             * png/gif-magic-pretending segments, then always restore the
++             * read position. When a fake image magic is found we do not
++             * assert the format ourselves: the generic probe is re-run with
++             * (a) an offset that breaks the image signature and (b) a NULL
++             * filename so that the .webp-style URL extension can no longer
++             * boost image demuxer scores. The probe then decides from the
++             * actual payload (e.g. mpegts via 0x47 + 188 alignment). This
++             * keeps the HLS layer free of format assumptions: malformed
++             * png/gif-looking garbage simply fails the probe at header time
++             * instead of being forced into mpegts. */
++            {
++                uint8_t b[10] = { 0 };
++                unsigned probe_offset = 0;
++                const char *probe_url = url;
++                int n = avio_read(&pls->pb.pub, b, sizeof(b));
++                if (n < 0 && n != AVERROR_EOF) {
++                    /* propagate real I/O errors like av_probe_input_buffer2()
++                     * does, instead of degrading them into a second probe */
++                    ret = n;
++                    av_log(s, AV_LOG_ERROR, "Failed to read segment header for probing: %s\n",
++                           av_err2str(ret));
++                    avformat_free_context(pls->ctx);
++                    pls->ctx = NULL;
++                    av_free(url);
++                    return ret;
++                }
++                if (n == AVERROR_EOF)
++                    n = 0;
++                if ((ret = avio_seek(&pls->pb.pub, 0, SEEK_SET)) < 0) {
++                    av_log(s, AV_LOG_ERROR, "Failed to restore segment read position after signature check: %s\n",
++                           av_err2str(ret));
++                    avformat_free_context(pls->ctx);
++                    pls->ctx = NULL;
++                    av_free(url);
++                    return ret;
++                }
++                if (!c->seg_allow_img) {
++                    if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) {
++                        probe_offset = 3;  /* break the png signature for the probe */
++                        probe_url = NULL;  /* drop misleading extension scores */
++                        av_log(s, AV_LOG_INFO, "Segment starts with png magic, probing without filename at offset %u\n", probe_offset);
++                    } else if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))) {
++                        probe_offset = 10; /* break the gif signature for the probe */
++                        probe_url = NULL;
++                        av_log(s, AV_LOG_INFO, "Segment starts with gif magic, probing without filename at offset %u\n", probe_offset);
 +                    }
 +                }
++                ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, probe_url, NULL, probe_offset, 0);
 +            }
-+
-+            ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, url, NULL, skip, 0);
              if (ret < 0) {
                  /* Free the ctx - it isn't initialized properly at this point,
                  * so avformat_close_input shouldn't be called. If
-@@ -2325,6 +2373,67 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
+@@ -2325,6 +2399,67 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                  }
  
                  seg = current_segment(pls);
@@ -176,7 +202,7 @@ index 8a96a37..579316d 100644
                  if (seg && seg->key_type == KEY_SAMPLE_AES && !strstr(pls->ctx->iformat->name, "mov")) {
                      enum AVCodecID codec_id = pls->ctx->streams[pls->pkt->stream_index]->codecpar->codec_id;
                      memcpy(c->crypto_ctx.iv, seg->iv, sizeof(seg->iv));
-@@ -2438,6 +2547,9 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
+@@ -2438,6 +2573,9 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
                                 int64_t timestamp, int flags)
  {
      HLSContext *c = s->priv_data;
@@ -186,11 +212,11 @@ index 8a96a37..579316d 100644
      struct playlist *seek_pls = NULL;
      int i, j;
      int stream_subdemuxer_index;
-@@ -2562,6 +2674,10 @@ static const AVOption hls_options[] = {
+@@ -2562,6 +2700,10 @@ static const AVOption hls_options[] = {
          OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
      {"seg_max_retry", "Maximum number of times to reload a segment on error.",
       OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
-+    {"seg_allow_img", "Allow segments detected as gif and png images, 0 = disable, 1 = enable",
++    {"seg_allow_img", "Allow PNG/GIF-signature HLS segments to participate in normal image probing; 0 = probe past image disguise, 1 = normal probing",
 +        OFFSET(seg_allow_img), AV_OPT_TYPE_BOOL, { .i64 = 0}, 0, 1, FLAGS},
 +    {"hls_ad_filter", "Filter ad segments based on PTS discontinuity (Kazumi)",
 +        OFFSET(hls_ad_filter), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
